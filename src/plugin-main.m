@@ -20,6 +20,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <plugin-support.h>
 #include <util/threading.h>
 #include <Vision/Vision.h>
+#include <stdatomic.h>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
@@ -41,6 +42,9 @@ struct vision_data {
     dispatch_queue_t mask_queue;
     pthread_mutex_t pixelBufferMutex;
     CVPixelBufferRef pixelBufferOut;
+
+    atomic_bool in_flight;
+    atomic_bool destroyed;
 };
 
 static const char *vision_get_name(void *)
@@ -51,6 +55,12 @@ static const char *vision_get_name(void *)
 static void vision_render(void *filter_ptr, gs_effect_t *)
 {
     struct vision_data *filter = filter_ptr;
+
+    /* P0-2: Don't touch any state once teardown has begun */
+    if (atomic_load(&filter->destroyed)) {
+        obs_source_skip_video_filter(filter->context);
+        return;
+    }
 
     /* STEP ZERO: Prepare texrender */
     gs_texrender_reset(filter->texrender);
@@ -65,6 +75,12 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
 
     const uint32_t width = obs_source_get_base_width(target);
     const uint32_t height = obs_source_get_base_height(target);
+
+    /* P0-5: Guard zero-size source before any surface/buffer creation */
+    if (width == 0 || height == 0) {
+        obs_source_skip_video_filter(filter->context);
+        return;
+    }
 
     /* STEP ONE: Retrieve texture */
     gs_blend_state_push();
@@ -92,55 +108,96 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
     enum gs_color_format format = gs_texture_get_color_format(source_texture);
 
     /* STEP THREE: Creation of new mask */
-    /* STEP THREE point one: Create new pixel buffer from source texture */
-    if (filter->stagesurf && (width != gs_stagesurface_get_width(filter->stagesurf) ||
-                              height != gs_stagesurface_get_height(filter->stagesurf))) {
-        gs_stagesurface_destroy(filter->stagesurf);
-        filter->stagesurf = NULL;
+    /* P0-4: single-flight — only stage + dispatch a new request when none is in flight.
+	 * Frames arriving while busy are dropped (bounded mask staleness). */
+    if (!atomic_load(&filter->in_flight)) {
+        /* STEP THREE point one: Stage source texture into an owned pixel buffer */
+        if (filter->stagesurf && (width != gs_stagesurface_get_width(filter->stagesurf) ||
+                                  height != gs_stagesurface_get_height(filter->stagesurf))) {
+            gs_stagesurface_destroy(filter->stagesurf);
+            filter->stagesurf = NULL;
+        }
+        if (!filter->stagesurf) {
+            filter->stagesurf = gs_stagesurface_create(width, height, format);
+        }
+
+        uint8_t *data;
+        uint32_t linesize;
+        if (filter->stagesurf) {
+            gs_stage_texture(filter->stagesurf, source_texture);
+            if (gs_stagesurface_map(filter->stagesurf, &data, &linesize)) {
+                /* P0-3: copy the staged bytes into an OWNED CVPixelBuffer while the
+				 * surface is still mapped, so the async request never reads unmapped memory. */
+                CVPixelBufferRef pixelBufferIn = NULL;
+                CVReturn cr = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, NULL,
+                                                  &pixelBufferIn);
+                if (cr == kCVReturnSuccess && pixelBufferIn) {
+                    CVPixelBufferLockBaseAddress(pixelBufferIn, 0);
+                    uint8_t *dst = CVPixelBufferGetBaseAddress(pixelBufferIn);
+                    const size_t dst_stride = CVPixelBufferGetBytesPerRow(pixelBufferIn);
+                    const size_t copy_bytes = (size_t) width * 4; /* 32BGRA */
+                    for (uint32_t y = 0; y < height; y++) {
+                        memcpy(dst + (size_t) y * dst_stride, data + (size_t) y * linesize, copy_bytes);
+                    }
+                    CVPixelBufferUnlockBaseAddress(pixelBufferIn, 0);
+                    gs_stagesurface_unmap(filter->stagesurf);
+
+                    /* P0-6: snapshot quality BY VALUE on the graphics thread */
+                    const VNGeneratePersonSegmentationRequestQualityLevel quality = filter->qualityLevel;
+
+                    /* STEP THREE point two: Dispatch creation of new mask */
+                    if (!atomic_exchange(&filter->in_flight, true)) {
+                        dispatch_async(filter->mask_queue, ^{
+                            if (atomic_load(&filter->destroyed)) {
+                                CVPixelBufferRelease(pixelBufferIn);
+                                return;
+                            }
+                            filter->request.qualityLevel = quality;
+
+                            VNImageRequestHandler *handler =
+                                [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pixelBufferIn options:@ {}];
+                            NSArray *requests = @[filter->request];
+                            [handler performRequests:requests error:nil];
+
+                            if (filter->request.results.firstObject.pixelBuffer) {
+                                CVPixelBufferRef mask = filter->request.results.firstObject.pixelBuffer;
+                                pthread_mutex_lock(&filter->pixelBufferMutex);
+                                if (filter->pixelBufferOut)
+                                    CVPixelBufferRelease(filter->pixelBufferOut);
+                                filter->pixelBufferOut = mask;
+                                CVPixelBufferRetain(filter->pixelBufferOut);
+                                pthread_mutex_unlock(&filter->pixelBufferMutex);
+                            }
+
+                            CVPixelBufferRelease(pixelBufferIn);
+                            [handler release];
+                            atomic_store(&filter->in_flight, false);
+                        });
+                    } else {
+                        /* Lost the single-flight race; drop this frame */
+                        CVPixelBufferRelease(pixelBufferIn);
+                    }
+                } else {
+                    if (pixelBufferIn)
+                        CVPixelBufferRelease(pixelBufferIn);
+                    gs_stagesurface_unmap(filter->stagesurf);
+                }
+            }
+        }
     }
-    if (!filter->stagesurf) {
-        filter->stagesurf = gs_stagesurface_create(width, height, format);
-    }
-    gs_stage_texture(filter->stagesurf, source_texture);
-    uint8_t *data;
-    uint32_t linesize;
-    gs_stagesurface_map(filter->stagesurf, &data, &linesize);
-    CVPixelBufferRef pixelBufferIn;
-    CVPixelBufferCreateWithBytes(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, data, linesize, nil,
-                                 nil, nil, &pixelBufferIn);
-    gs_stagesurface_unmap(filter->stagesurf);
 
-    /* STEP THREE point two: Dispatch creation of new mask */
-    dispatch_async(filter->mask_queue, ^{
-        filter->request.qualityLevel = filter->qualityLevel;
-
-        NSDictionary *empty = [[NSDictionary alloc] init];
-        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pixelBufferIn
-                                                                                      options:empty];
-
-        NSArray *requests = [[NSArray alloc] initWithObjects:filter->request, nil];
-        [handler performRequests:requests error:nil];
-        pthread_mutex_lock(&filter->pixelBufferMutex);
-        if (filter->pixelBufferOut)
-            CVPixelBufferRelease(filter->pixelBufferOut);
-        filter->pixelBufferOut = filter->request.results.firstObject.pixelBuffer;
-        CVPixelBufferRetain(filter->pixelBufferOut);
-        pthread_mutex_unlock(&filter->pixelBufferMutex);
-        CVPixelBufferRelease(pixelBufferIn);
-        [empty release];
-        [handler release];
-        [requests release];
-    });
+    /* STEP FOUR: Retrieve new mask texture */
+    /* P0-6: read pixelBufferOut + build the mask texture ENTIRELY under the mutex */
+    pthread_mutex_lock(&filter->pixelBufferMutex);
 
     /* Don't render if the output pixel buffer doesn't exist, like before the first frame is processed */
     if (!filter->pixelBufferOut) {
+        pthread_mutex_unlock(&filter->pixelBufferMutex);
         obs_source_skip_video_filter(filter->context);
         return;
     }
 
-    /* STEP FOUR: Retrieve new mask texture */
     /* STEP FOUR point one: Prepare mask texture */
-    pthread_mutex_lock(&filter->pixelBufferMutex);
     CVPixelBufferLockBaseAddress(filter->pixelBufferOut, kCVPixelBufferLock_ReadOnly);
 
     const uint32_t out_width = (uint32_t) CVPixelBufferGetWidth(filter->pixelBufferOut);
@@ -211,6 +268,8 @@ static void *vision_create(obs_data_t *settings, struct obs_source *source)
     filter->context = source;
     filter->request = [[VNGeneratePersonSegmentationRequest alloc] init];
     pthread_mutex_init(&filter->pixelBufferMutex, NULL);
+    atomic_init(&filter->in_flight, false);
+    atomic_init(&filter->destroyed, false);
 
     /* Performing the segmentation in realtime takes too long and will lag OBS, especially at higher
 	 * quality modes. As such, defer it to a different thread. This will make the mask lag behind a few
@@ -234,6 +293,15 @@ static void vision_destroy(void *filter_ptr)
 {
     struct vision_data *filter = filter_ptr;
 
+    /* P0-2: Signal teardown, then drain the serial queue so any in-flight Vision
+	 * block finishes (and releases its owned input buffer) before we free anything.
+	 * Run the drain OUTSIDE obs_enter_graphics() — never hold the graphics lock
+	 * across the (slow) Vision completion. */
+    atomic_store(&filter->destroyed, true);
+    dispatch_sync(filter->mask_queue, ^ {
+                  });
+
+    /* GPU objects — graphics thread only */
     obs_enter_graphics();
     gs_texrender_destroy(filter->texrender);
     if (filter->stagesurf) {
@@ -244,8 +312,17 @@ static void vision_destroy(void *filter_ptr)
     }
     gs_effect_destroy(filter->effect);
     obs_leave_graphics();
+
+    /* P0-2: release the resources the old teardown leaked */
+    [filter->request release];
+    if (filter->pixelBufferOut) {
+        CVPixelBufferRelease(filter->pixelBufferOut);
+    }
+    pthread_mutex_destroy(&filter->pixelBufferMutex);
+    dispatch_release(filter->mask_queue);
+
     bfree(filter);
-};
+}
 
 bool obs_module_load(void)
 {
