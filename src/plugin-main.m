@@ -131,8 +131,11 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
                 CVPixelBufferRef pixelBufferIn = NULL;
                 CVReturn cr = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, NULL,
                                                   &pixelBufferIn);
-                if (cr == kCVReturnSuccess && pixelBufferIn) {
-                    CVPixelBufferLockBaseAddress(pixelBufferIn, 0);
+                /* P1-1: also verify the input buffer locks before reading/writing its base
+				 * address; a failed lock leaves the base address invalid. On failure, free the
+				 * owned buffer, unmap, and skip staging this frame (no new request dispatched). */
+                if (cr == kCVReturnSuccess && pixelBufferIn &&
+                    CVPixelBufferLockBaseAddress(pixelBufferIn, 0) == kCVReturnSuccess) {
                     uint8_t *dst = CVPixelBufferGetBaseAddress(pixelBufferIn);
                     const size_t dst_stride = CVPixelBufferGetBytesPerRow(pixelBufferIn);
                     const size_t copy_bytes = (size_t) width * 4; /* 32BGRA */
@@ -157,9 +160,13 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
                             VNImageRequestHandler *handler =
                                 [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pixelBufferIn options:@ {}];
                             NSArray *requests = @[filter->request];
-                            [handler performRequests:requests error:nil];
 
-                            if (filter->request.results.firstObject.pixelBuffer) {
+                            /* P1-2: capture and check the Vision error instead of passing error:nil.
+							 * `err` is an autoreleased NSError owned by the framework — no release here. */
+                            NSError *err = nil;
+                            BOOL ok = [handler performRequests:requests error:&err];
+
+                            if (ok && filter->request.results.firstObject.pixelBuffer) {
                                 CVPixelBufferRef mask = filter->request.results.firstObject.pixelBuffer;
                                 pthread_mutex_lock(&filter->pixelBufferMutex);
                                 if (filter->pixelBufferOut)
@@ -167,6 +174,14 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
                                 filter->pixelBufferOut = mask;
                                 CVPixelBufferRetain(filter->pixelBufferOut);
                                 pthread_mutex_unlock(&filter->pixelBufferMutex);
+                            } else if (!ok) {
+                                /* P1-2: request failed — keep the last good mask (leave
+								 * pixelBufferOut untouched so the background does not flash back in). */
+                                obs_log(LOG_WARNING, "Vision request failed: %s",
+                                        err ? err.localizedDescription.UTF8String : "unknown error");
+                            } else {
+                                /* P1-2: request succeeded but returned no mask — keep last good mask. */
+                                obs_log(LOG_WARNING, "Vision request returned no segmentation mask");
                             }
 
                             CVPixelBufferRelease(pixelBufferIn);
@@ -178,11 +193,18 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
                         CVPixelBufferRelease(pixelBufferIn);
                     }
                 } else {
+                    /* P1-1: input buffer create or lock failed — release any owned buffer and
+					 * unmap; skip this frame (the last good mask, if any, keeps applying). */
+                    obs_log(LOG_WARNING, "Failed to create/lock input pixel buffer; skipping frame");
                     if (pixelBufferIn)
                         CVPixelBufferRelease(pixelBufferIn);
                     gs_stagesurface_unmap(filter->stagesurf);
                 }
             }
+        } else {
+            /* P1-1: staging surface creation failed; can't stage this frame. The existing
+			 * structural guard already prevents use; add a log so the failure is visible. */
+            obs_log(LOG_WARNING, "Failed to create staging surface (%ux%u)", width, height);
         }
     }
 
@@ -198,7 +220,13 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
     }
 
     /* STEP FOUR point one: Prepare mask texture */
-    CVPixelBufferLockBaseAddress(filter->pixelBufferOut, kCVPixelBufferLock_ReadOnly);
+    /* P1-1: a failed read-only lock leaves the base address invalid; unlock the mutex and
+	 * skip this frame rather than read garbage. The last good mask remains for next frame. */
+    if (CVPixelBufferLockBaseAddress(filter->pixelBufferOut, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        pthread_mutex_unlock(&filter->pixelBufferMutex);
+        obs_source_skip_video_filter(filter->context);
+        return;
+    }
 
     const uint32_t out_width = (uint32_t) CVPixelBufferGetWidth(filter->pixelBufferOut);
     const uint32_t out_height = (uint32_t) CVPixelBufferGetHeight(filter->pixelBufferOut);
@@ -281,6 +309,29 @@ static void *vision_create(obs_data_t *settings, struct obs_source *source)
     char *file = obs_module_file("alpha_mask.effect");
     filter->effect = gs_effect_create_from_file(file, NULL);
     bfree(file);
+
+    /* P1-1: If the shader fails to compile/load, gs_effect_create_from_file returns NULL.
+	 * The eparam lookups below would then dereference a NULL effect, and vision_render would
+	 * later NULL-deref the params. Fail vision_create cleanly so OBS refuses to attach the
+	 * filter rather than crash later. Tear down only what has been allocated up to here:
+	 * graphics objects inside graphics (effect is NULL; texrender may exist), then the ObjC
+	 * request, the mutex, and the dispatch queue outside graphics, then bfree last. */
+    if (!filter->effect) {
+        if (filter->texrender) {
+            gs_texrender_destroy(filter->texrender);
+        }
+        gs_effect_destroy(filter->effect);
+        obs_leave_graphics();
+
+        obs_log(LOG_ERROR, "Failed to load alpha_mask.effect; filter will not attach");
+
+        [filter->request release];
+        pthread_mutex_destroy(&filter->pixelBufferMutex);
+        dispatch_release(filter->mask_queue);
+        bfree(filter);
+        return NULL;
+    }
+
     filter->src_param = gs_effect_get_param_by_name(filter->effect, "image");
     filter->mask_param = gs_effect_get_param_by_name(filter->effect, "mask");
     filter->threshold_param = gs_effect_get_param_by_name(filter->effect, "threshold");
