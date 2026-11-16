@@ -16,6 +16,7 @@
 !CMakePresets.json
 !LICENSE
 !README.md
+!build-local.zsh
 
 # Exclude lock files
 *.lock.json
