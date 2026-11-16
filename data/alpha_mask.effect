@@ -2,7 +2,10 @@ uniform float4x4 ViewProj;
 uniform texture2d image;
 
 uniform texture2d mask;
-uniform float threshold;
+uniform float mask_low;
+uniform float mask_high;
+uniform float2 mask_texel;
+uniform float range_scale;
 
 sampler_state texSampler {
 	Filter    = Linear;
@@ -27,10 +30,37 @@ VertData VSDefault(VertData v_in)
 	return v_out;
 }
 
+/* One tap of a joint bilateral filter: neighbouring mask values count for more the closer the picture's colour
+ * there is to the colour at the pixel being shaded. Returns (weighted mask, weight). */
+float2 RefineTap(float2 uv, float3 center, float spatial)
+{
+	float3 diff = image.Sample(texSampler, uv).rgb - center;
+	float weight = spatial * exp(-dot(diff, diff) * range_scale);
+	return float2(weight * mask.Sample(texSampler, uv).a, weight);
+}
+
 float4 PSMask(FragData f_in) : TARGET
 {
 	float4 rgba = image.Sample(texSampler, f_in.uv);
-	rgba *= smoothstep(threshold - 0.1,threshold,mask.Sample(texSampler, f_in.uv).a);
+	float matte = mask.Sample(texSampler, f_in.uv).a;
+
+	/* The mask has fewer pixels than the picture, so its edges are blurrier than the real ones. Pull them back
+	 * onto the edges that are visible in the picture. */
+	if (range_scale > 0.0) {
+		float2 acc = float2(matte, 1.0);
+		acc += RefineTap(f_in.uv + float2(-mask_texel.x, 0.0), rgba.rgb, 1.0);
+		acc += RefineTap(f_in.uv + float2( mask_texel.x, 0.0), rgba.rgb, 1.0);
+		acc += RefineTap(f_in.uv + float2(0.0, -mask_texel.y), rgba.rgb, 1.0);
+		acc += RefineTap(f_in.uv + float2(0.0,  mask_texel.y), rgba.rgb, 1.0);
+		acc += RefineTap(f_in.uv + float2(-mask_texel.x, -mask_texel.y), rgba.rgb, 0.7);
+		acc += RefineTap(f_in.uv + float2( mask_texel.x, -mask_texel.y), rgba.rgb, 0.7);
+		acc += RefineTap(f_in.uv + float2(-mask_texel.x,  mask_texel.y), rgba.rgb, 0.7);
+		acc += RefineTap(f_in.uv + float2( mask_texel.x,  mask_texel.y), rgba.rgb, 0.7);
+		matte = acc.x / acc.y;
+	}
+
+	/* With the default range of 0..1 this is the matte exactly as Vision produced it. */
+	rgba *= clamp((matte - mask_low) / (mask_high - mask_low), 0.0, 1.0);
 	return rgba;
 }
 
